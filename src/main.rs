@@ -1,15 +1,36 @@
-use chrono::{DateTime, Local, TimeZone};
+mod todo;
+use chrono::{Local, TimeZone};
 use colored::*;
-use dirs::home_dir;
+use ctrlc;
 use lazy_static::lazy_static;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io;
 use std::io::Write;
-use std::path::PathBuf;
+use std::process;
+use todo::{load_todos, save_todos, Status, Todo};
 
-const DB_FILE: &str = ".todos";
+enum TimeFormat {
+    Absolute,
+    Remaining,
+}
+
+struct Viewer {
+    time_format: TimeFormat,
+}
+
+impl Viewer {
+    fn new() -> Self {
+        Self {
+            time_format: TimeFormat::Remaining,
+        }
+    }
+
+    fn flip_time_format(&mut self) {
+        self.time_format = match self.time_format {
+            TimeFormat::Absolute => TimeFormat::Remaining,
+            TimeFormat::Remaining => TimeFormat::Absolute,
+        };
+    }
+}
 
 lazy_static! {
     static ref DELETE_RE: Regex = Regex::new(r"^d\s+(?P<index>\d+)$").unwrap();
@@ -18,57 +39,18 @@ lazy_static! {
     static ref EDIT_RE: Regex = Regex::new(r"^e (?P<index>\d+) (?P<new_name>.+)$").unwrap();
 }
 
-#[derive(Serialize, Deserialize)]
-struct Todo {
-    name: String,
-    completed: bool,
-    deadline: DateTime<Local>,
-}
-
-impl std::fmt::Display for Todo {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let formatted_date = self.deadline.format("%d %b ⋅ %H:%M");
-        write!(
-            f,
-            "[{}] ({}) {}",
-            if self.completed { "✓" } else { " " },
-            formatted_date,
-            self.name
-        )
-    }
-}
-
-fn get_db_path() -> PathBuf {
-    home_dir()
-        .expect("Could not find home directory")
-        .join(DB_FILE)
-}
-
-fn save_todos(todos: &Vec<Todo>) -> io::Result<()> {
-    let db_path = get_db_path();
-    let json = serde_json::to_string(todos)?;
-    fs::write(&db_path, json)?;
-    Ok(())
-}
-
-fn load_todos() -> io::Result<Vec<Todo>> {
-    let db_path = get_db_path();
-    if !db_path.exists() {
-        fs::write(&db_path, "[]")?;
-        return Ok(Vec::new());
+fn process_command(input: &str, todos: &mut Vec<Todo>, viewer: &mut Viewer) -> Result<(), String> {
+    // short commands
+    if input.trim().len() == 1 {
+        match input.trim() {
+            "q" => process::exit(0),
+            "s" => {
+                viewer.flip_time_format();
+            }
+            _ => {}
+        };
     }
 
-    let file_contents = fs::read_to_string(&db_path)?;
-    if file_contents.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    match serde_json::from_str(&file_contents) {
-        Ok(todos) => Ok(todos),
-        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-    }
-}
-
-fn process_command(input: &str, todos: &mut Vec<Todo>) -> Result<(), String> {
     if let Some(caps) = DELETE_RE.captures(input) {
         let index = caps["index"]
             .parse::<usize>()
@@ -86,7 +68,12 @@ fn process_command(input: &str, todos: &mut Vec<Todo>) -> Result<(), String> {
             .map_err(|_| "Invalid index format")?;
 
         if index < todos.len() {
-            todos[index].completed = !todos[index].completed;
+            let new_status = match todos[index].status {
+                Status::NotStarted => Status::InProgress,
+                Status::InProgress => Status::Completed,
+                Status::Completed => Status::NotStarted,
+            };
+            todos[index].status = new_status;
             Ok(())
         } else {
             Err("Index out of bounds".to_string())
@@ -110,7 +97,7 @@ fn process_command(input: &str, todos: &mut Vec<Todo>) -> Result<(), String> {
 
         todos.push(Todo {
             name: caps["name"].trim().to_string(),
-            completed: false,
+            status: Status::NotStarted,
             deadline,
         });
         Ok(())
@@ -119,21 +106,24 @@ fn process_command(input: &str, todos: &mut Vec<Todo>) -> Result<(), String> {
     }
 }
 
-fn show_todos(todos: &Vec<Todo>) {
+fn show_todos(todos: &Vec<Todo>, viewer: &Viewer) {
     print!("\x1B[2J\x1B[1;1H");
 
+    let mut x = 0;
     let current = Local::now();
 
-    let mut x = 0;
     for todo in todos {
-        let t = format!("{}", todo);
-        if todo.completed {
-            println!("{}. {}", x, t.green());
-        } else if todo.deadline < current {
-            println!("{}. {}", x, t.red());
-        } else {
-            println!("{}. {}", x, t);
+        let t = todo.print(viewer);
+        let mut z = match todo.status {
+            Status::NotStarted => t.white(),
+            Status::InProgress => t.yellow(),
+            Status::Completed => t.green(),
+        };
+        if todo.deadline < current {
+            z = z.red();
         }
+
+        println!("{}.\t{}", x, z);
         x += 1;
     }
 
@@ -141,18 +131,24 @@ fn show_todos(todos: &Vec<Todo>) {
     std::io::stdout().flush().unwrap();
 }
 
-fn parse_instruction(todos: &mut Vec<Todo>) {
+fn parse_instruction(todos: &mut Vec<Todo>, viewer: &mut Viewer) {
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).unwrap();
     let input = input.trim();
 
-    match process_command(input, todos) {
+    match process_command(input, todos, viewer) {
         Ok(_) => (),
         Err(e) => println!("Error: {}", e),
     }
 }
 
 fn main() {
+    ctrlc::set_handler(move || {
+        process::exit(0);
+    })
+    .unwrap();
+
+    let mut viewer = Viewer::new();
     let mut todos: Vec<Todo> = Vec::new();
     match load_todos() {
         Ok(t) => todos = t,
@@ -162,7 +158,7 @@ fn main() {
     loop {
         todos.sort_by(|a, b| a.deadline.cmp(&b.deadline));
         save_todos(&todos).unwrap();
-        show_todos(&todos);
-        parse_instruction(&mut todos);
+        show_todos(&todos, &viewer);
+        parse_instruction(&mut todos, &mut viewer);
     }
 }
